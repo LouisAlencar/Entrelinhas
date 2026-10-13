@@ -1,7 +1,7 @@
-export type Question = { id: string; prompt: string; options: string[]; correct: number; explanation: string; evidence: string; page: number; topic: string };
+export type Question = { id: string; prompt: string; options: string[]; correct: number; explanation: string; evidence: string; page: number; topic: string; source?: string };
 export type Notebook = { id: string; title: string; subject: string; description: string; color: "sage" | "peach" | "lavender"; icon: "leaf" | "design" | "history"; source: string; questions: Question[] };
 export type LocalFile = { id: string; notebookId: string; name: string; size: number };
-export type Attempt = { id: string; notebookId: string; title: string; date: string; score: number; total: number };
+export type Attempt = { id: string; notebookId: string; title: string; date: string; score: number; total: number; kind?: "ai" | "demo" };
 export const notebooks: Notebook[] = [
   { id: "biologia", title: "Biologia celular", subject: "BIOLOGIA", description: "Um universo inteiro dentro de cada célula.", color: "sage", icon: "leaf", source: "Guia demonstrativo · Biologia celular", questions: [
     { id: "bio-1", topic: "Organelas", prompt: "Qual organela é responsável pela maior parte da produção de ATP na respiração celular aeróbica?", options: ["Complexo golgiense", "Mitocôndria", "Lisossomo", "Ribossomo"], correct: 1, explanation: "A mitocôndria realiza etapas da respiração celular que produzem ATP. O complexo golgiense modifica e distribui moléculas, os lisossomos participam da digestão e os ribossomos sintetizam proteínas.", evidence: "Nas células eucarióticas, as mitocôndrias realizam o ciclo de Krebs e a fosforilação oxidativa, responsável pela maior parte do ATP produzido na respiração aeróbica.", page: 1 },

@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { samplePdf } from "../fixtures/pdf";
 
 test.beforeEach(async ({ page }) => { await page.goto("/"); });
 
@@ -40,8 +41,8 @@ test("caderno, PDF inválido, seleção válida e remoção", async ({ page }) =
   await expect(page.getByRole("heading", { name: "Minha apostila" })).toBeVisible();
   await page.locator('input[type="file"]').setInputFiles({ name: "invalido.pdf", mimeType: "application/pdf", buffer: Buffer.from("not a PDF") });
   await expect(page.locator(".error-message")).toContainText("não parece ser um PDF válido");
-  await page.locator('input[type="file"]').setInputFiles({ name: "exemplo.pdf", mimeType: "application/pdf", buffer: Buffer.from("%PDF-1.7\n%%EOF") });
-  await expect(page.getByText("apenas selecionado, não processado", { exact: false })).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles({ name: "exemplo.pdf", mimeType: "application/pdf", buffer: samplePdf() });
+  await expect(page.getByText("páginas prontas", { exact: false })).toBeVisible({ timeout: 15000 });
   await page.getByRole("button", { name: "Remover exemplo.pdf" }).click();
   await expect(page.locator(".source-file")).toHaveCount(0);
   await page.reload();

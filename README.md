@@ -1,68 +1,70 @@
 # Entrelinhas
 
-Uma plataforma de estudos que transforma materiais em prática. **Esta primeira entrega é uma demonstração local e navegável, sem IA ou backend.**
+Plataforma de estudos de portfólio: leia um PDF, gere questões com Gemini e revise respostas com referências ao texto. Três cadernos demonstrativos funcionam sem API.
 
 ## Executar
 
-Requisitos: Node.js 20.9 ou superior e pnpm.
+Node.js compatível com as dependências (recomendado: 22.13+ ou 24) e pnpm.
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-Abra http://127.0.0.1:3000. Para compilar: `pnpm build`. Para executar a compilação: `pnpm start`.
+Abra http://127.0.0.1:3000. `pnpm build` compila; `pnpm start` executa a compilação. Os scripts `predev` e `prebuild` copiam o worker PDF.js para `public/`.
 
-Neste computador, com as dependências já instaladas, também é possível executar no PowerShell:
+Neste computador, `Start-Entrelinhas.ps1` também encontra o runtime do Codex. Mantenha o terminal aberto durante o uso local.
 
-```powershell
-& 'E:\roadmapAI\entrelinhas\Start-Entrelinhas.ps1'
-```
+## Configurar na Vercel
 
-O script usa pnpm no PATH ou o runtime fornecido pelo Codex. Mantenha o terminal aberto enquanto usa o site; Ctrl+C encerra a prévia.
+1. No SQL Editor do Supabase, execute [001_ai_quota.sql](supabase/migrations/001_ai_quota.sql).
+2. Em Settings → Environment Variables da Vercel, configure em Production:
 
-## O que funciona
+| Variável | Valor |
+|---|---|
+| `GEMINI_API_KEY` | Chave da Gemini Developer API |
+| `GEMINI_MODEL` | Opcional; padrão `gemini-2.5-flash` |
+| `SUPABASE_URL` | URL HTTPS do projeto Supabase |
+| `SUPABASE_SERVICE_ROLE_KEY` | Chave secreta `service_role` do Supabase |
 
-- Biblioteca com busca e três cadernos demonstrativos com conteúdo autoral.
-- Criação de cadernos pessoais, persistidos no navegador.
-- Seleção de PDFs por clique ou arrastar, com validação de extensão, tamanho, assinatura inicial e duplicação. A assinatura não representa validação completa do PDF.
-- Prática com 3 ou 5 questões: estudo com correção imediata ou simulado com correção ao final.
-- Explicações, trechos de referência, download dos guias em TXT, revisão de erros e histórico.
-- Layout responsivo, alternativas acessíveis por teclado, diálogos com gestão de foco e respeito à redução de movimento.
+3. Faça um novo deploy. Localmente, copie `.env.example` para `.env.local` e preencha no computador.
 
-## Limites honestos da demonstração
+Nunca use `NEXT_PUBLIC_` nessas variáveis nem envie chaves ao GitHub. O modo demo não precisa delas. Disponibilidade gratuita e cotas do Gemini dependem da conta. A aplicação não ativa faturamento nem muda de provedor automaticamente.
 
-Não há login, upload ao servidor, leitura do conteúdo de PDFs, OCR, geração por IA ou banco remoto. Arquivos selecionados **não são persistidos**: apenas nome, tamanho e associação ao caderno ficam em `localStorage`. Os exercícios vêm de `src/lib/demo.ts`, nunca dos arquivos selecionados. Referências apontam a seções dos guias demonstrativos, não a páginas de PDFs. Dados locais são limitados a este navegador; apagá-los remove cadernos e histórico. Uma prática incompleta não é persistida. Resultados demonstrativos não medem domínio real de uma matéria.
+## Fluxo
 
-Os gabaritos estão no cliente nesta versão demonstrativa. Antes de disponibilizar simulados reais, transferir correção, autorização e liberação de gabaritos para o servidor.
+- Até 5 PDFs por caderno, cada um com até 5 MB, 20 páginas e 60 mil caracteres.
+- O navegador extrai o texto; um PDF é escolhido por geração, com 3 ou 5 questões.
+- O usuário autoriza o envio do texto ao Gemini. Na camada gratuita, o Google pode usar os dados para melhoria dos produtos; não envie materiais confidenciais.
+- O servidor valida a entrada, reserva uma cota atômica e chama Gemini uma vez, sem retries automáticos.
+- Questões exigem quatro alternativas distintas, gabarito válido, enunciado único e trecho literal presente na página citada.
+- A validação confere estrutura e referência; não prova correção pedagógica ou factual. Revise o material original.
+- A referência usa a posição física da página no PDF, não necessariamente a numeração impressa.
+- Sem OCR ou interpretação de imagens, diagramas e fórmulas complexas. Páginas sem texto são sinalizadas.
 
-## Arquitetura
+## Cotas e segurança
 
-- Next.js App Router + React + TypeScript.
-- Tailwind CSS e estilos próprios com tokens de cor.
-- Componentes Button e Dialog com padrão shadcn/ui, Radix, CVA e Lucide.
-- `src/components/study-app.tsx`: fluxo interativo e persistência local.
-- `src/lib/demo.ts`: conteúdo de exemplo, validação básica e correção.
-- Sem fontes, imagens ou APIs externas em tempo de execução.
+A RPC SQL reserva atomicamente até **20 tentativas/dia no site, 3 por conexão/dia e 2 por minuto no site**, usando UTC. Tentativas com erro também contam. A cota do provedor pode ser inferior.
 
-## Verificação
+Na Vercel, a conexão é identificada pelo cabeçalho sobrescrito pela plataforma `x-vercel-forwarded-for`, convertido em HMAC. O banco não recebe texto de PDF nem IP bruto. Redes compartilhadas dividem a cota: isso não substitui autenticação de usuário. Sem configuração ou disponibilidade da RPC, nenhuma chamada ao Gemini é feita.
+
+Gabaritos de IA ficam em token AES-256-GCM, válido por duas horas. O cliente recebe perguntas sem gabarito; a rota de correção revela uma resposta no modo estudo ou todas após receber a tentativa completa. Refazer reutiliza as perguntas, sem consumo extra de IA. Este é um produto de autoestudo, não uma prova fiscalizada: o cliente pode consultar a rota de correção.
+
+## Persistência e privacidade
+
+PDFs, texto e sessão de questões ficam na memória da aba. Recarregar exige selecionar o PDF novamente; práticas incompletas não são recuperadas. Cadernos, nomes/tamanhos de arquivos e resultados ficam no `localStorage`, sem login ou sincronização. O servidor não persiste documentos ou perguntas. A política de retenção do provedor continua aplicável.
+
+## Arquitetura e testes
+
+Next.js App Router, React, TypeScript, Tailwind, componentes no padrão shadcn/ui/Radix e PDF.js sob demanda. `POST /api/generate` gera e valida; `POST /api/quiz` corrige sem chamar IA. Supabase guarda apenas contadores de uso, protegidos por RLS; a RPC é restrita à `service_role`.
 
 ```sh
-pnpm typecheck
 pnpm test
 pnpm build
-# Com o servidor iniciado em outra janela e Microsoft Edge instalado:
+# Com servidor iniciado e Microsoft Edge instalado:
 pnpm test:e2e
 ```
 
-Testes E2E cobrem prática, fontes, histórico, criação de caderno, validação de arquivo, simulado, navegação mobile e ausência de erros JS. As capturas ficam em `test-results/`. A configuração usa Edge para aproveitar o navegador do Windows; altere `channel` caso seu ambiente exija outro navegador.
+`PLAYWRIGHT_BASE_URL` permite testar outra porta. Testes cobrem validação, erros do provedor, cotas, sessões alteradas/expiradas, correção, PDFs, interface e persistência local. Os E2E usam PDF real de fixture e IA simulada para não consumir API. Capturas ficam em `test-results/`; verificação real em produção é separada.
 
-## Próximas entregas
-
-1. Extração de PDFs textuais preservando referências, com limite de páginas e tokens.
-2. API Gemini exclusivamente no servidor, saída estruturada, evidências e validação de questões.
-3. Supabase Auth, PostgreSQL e Storage privado, com políticas por usuário.
-4. Limites globais e por usuário, tratamento de indisponibilidade e modo demo permanente.
-5. Avaliação com materiais reais e publicação no Vercel Hobby, dentro das condições vigentes.
-
-Não é necessária chave de API para executar esta demonstração. Não inclua segredos no código ou em variáveis `NEXT_PUBLIC_*`.
+Próximas etapas: login, sincronização, retomada de práticas, extração mais rica, avaliação pedagógica e busca em coleções maiores.

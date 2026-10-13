@@ -6,6 +6,10 @@ import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { grade, notebooks, validateFile, type Attempt, type LocalFile, type Notebook, type Question } from "@/lib/demo";
 
+import { AiPanel } from "./ai-panel";
+import { extractPdf } from "@/lib/pdf-client";
+import type { SourceDocument } from "@/lib/ai-contract";
+
 type View = "library" | "notebook" | "quiz" | "result" | "history";
 type Stored = { custom: Notebook[]; files: LocalFile[]; attempts: Attempt[] };
 const STORAGE_KEY = "entrelinhas-demo-v1";
@@ -49,6 +53,13 @@ export function StudyApp() {
   const [selectedSource, setSelectedSource] = useState<Question | null>(null);
   const [onlyWrong, setOnlyWrong] = useState(false);
   const [exitOpen, setExitOpen] = useState(false);
+  const [documents, setDocuments] = useState<Record<string, SourceDocument>>({});
+  const [reading, setReading] = useState("");
+  const readingLock = useRef(false);
+  const [generating, setGenerating] = useState(false);
+  const [quizToken, setQuizToken] = useState("");
+  const [quizBusy, setQuizBusy] = useState(false);
+  const [quizError, setQuizError] = useState("");
   const [pendingView, setPendingView] = useState<View>("library");
   const fileRef = useRef<HTMLInputElement>(null);
   const mainRef = useRef<HTMLElement>(null);
@@ -69,6 +80,7 @@ export function StudyApp() {
 
   function navigate(next: View) {
     setMobileMenu(false);
+    if (generating || readingLock.current || quizBusy) { setNotice("Aguarde a operação em andamento antes de sair."); return; }
     if (view === "quiz" && next !== "quiz") { setPendingView(next); setExitOpen(true); return; }
     setView(next);
   }
@@ -80,32 +92,61 @@ export function StudyApp() {
     setStore(s => ({ ...s, custom: [...s.custom, book] })); setCreateOpen(false); setTitle(""); setSubject(""); openNotebook(book); setNotice("Caderno criado neste navegador.");
   }
   async function addFiles(list: FileList | null) {
-    if (!list) return;
-    setFileError("");
-    const added: LocalFile[] = []; const errors: string[] = [];
-    for (const file of Array.from(list)) {
-      const error = validateFile(file);
-      if (error) { errors.push(`${file.name}: ${error}`); continue; }
-      try {
-        const header = new TextDecoder().decode(await file.slice(0, 5).arrayBuffer());
-        if (header !== "%PDF-") { errors.push(`${file.name}: o conteúdo não parece ser um PDF válido.`); continue; }
-      } catch { errors.push(`Não foi possível abrir ${file.name}.`); continue; }
-      if ([...files, ...added].some(f => f.name === file.name && f.size === file.size)) { errors.push(`${file.name} já foi adicionado.`); continue; }
-      if (files.length + added.length >= 5) { errors.push("O limite da demonstração é 5 arquivos por caderno."); break; }
-      added.push({ id: crypto.randomUUID(), notebookId: active.id, name: file.name, size: file.size });
-    }
-    if (added.length) { setStore(s => ({ ...s, files: [...s.files, ...added] })); setNotice("Arquivo selecionado. A demonstração salva apenas nome e tamanho, sem envio ou leitura por IA."); }
-    if (errors.length) setFileError(errors.join(" "));
-    if (fileRef.current) fileRef.current.value = "";
+    if (!list || readingLock.current || generating) return;
+    readingLock.current = true; setFileError("");
+    const added: LocalFile[] = []; const extracted: Record<string, SourceDocument> = {}; const errors: string[] = [];
+    const notebookId = active.id;
+    try {
+      for (const file of Array.from(list)) {
+        const old = files.find(f => f.name === file.name && f.size === file.size);
+        if (added.some(f => f.name === file.name && f.size === file.size)) continue;
+        if (!old && files.length + added.length >= 5) { errors.push("O limite é 5 arquivos por caderno."); break; }
+        try {
+          setReading("Abrindo " + file.name + "…");
+          const document = await extractPdf(file, setReading);
+          const id = old?.id || crypto.randomUUID(); extracted[id] = document;
+          if (!old) added.push({ id, notebookId, name: file.name, size: file.size });
+          if (document.pages.some(p => p.text.length < 30)) errors.push(file.name + ": algumas páginas têm pouco ou nenhum texto. Imagens e páginas escaneadas não serão usadas.");
+        } catch (e) { errors.push(file.name + ": " + (e instanceof Error ? e.message : "Não foi possível ler o PDF.")); }
+      }
+      setDocuments(d => ({ ...d, ...extracted }));
+      if (added.length) setStore(s => ({ ...s, files: [...s.files, ...added] }));
+      if (Object.keys(extracted).length) setNotice("PDF lido neste navegador. O texto só será enviado ao Gemini quando você autorizar e gerar.");
+      if (errors.length) setFileError(errors.join(" "));
+    } finally { readingLock.current = false; setReading(""); if (fileRef.current) fileRef.current.value = ""; }
   }
-  function startQuiz() {
-    setQuestions(active.questions.slice(0, count)); setAnswers({}); setIndex(0); setConfirmed(false); setOnlyWrong(false); setView("quiz");
+  function beginQuiz(items: Question[], token = "", selectedMode = mode) {
+    setQuizToken(token); setQuestions(items); setMode(selectedMode); setAnswers({}); setIndex(0); setConfirmed(false); setOnlyWrong(false); setQuizError(""); setView("quiz");
   }
-  function finish() {
-    const attempt: Attempt = { id: crypto.randomUUID(), notebookId: active.id, title: active.title, date: new Date().toISOString(), score: grade(questions, answers), total: questions.length };
-    setStore(s => ({ ...s, attempts: [attempt, ...s.attempts].slice(0, 100) })); setView("result");
+  function startQuiz() { beginQuiz(active.questions.slice(0, count)); }
+  async function quizRequest(body: object) {
+    const response = await fetch("/api/quiz", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, token: quizToken }), signal: AbortSignal.timeout(15000) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Não foi possível corrigir a prática.");
+    return result;
   }
-  function nextQuestion() { if (index === questions.length - 1) finish(); else { setIndex(i => i + 1); setConfirmed(false); } }
+  async function finish() {
+    if (quizBusy) return;
+    setQuizBusy(true); setQuizError("");
+    try {
+      const result = quizToken ? await quizRequest({ action: "finish", answers }) : { questions, score: grade(questions, answers) };
+      setQuestions(result.questions);
+      const attempt: Attempt = { id: crypto.randomUUID(), notebookId: active.id, title: active.title, date: new Date().toISOString(), score: result.score, total: questions.length, kind: quizToken ? "ai" : "demo" };
+      setStore(s => ({ ...s, attempts: [attempt, ...s.attempts].slice(0, 100) })); setView("result");
+    } catch (e) { setQuizError(e instanceof Error ? e.message : "Falha de conexão. Tente novamente."); }
+    finally { setQuizBusy(false); }
+  }
+  async function confirmAnswer() {
+    if (quizBusy) return;
+    if (mode === "exam") { nextQuestion(); return; }
+    setQuizBusy(true); setQuizError("");
+    try {
+      if (quizToken) { const result = await quizRequest({ action: "answer", questionId: current.id, answer: answers[current.id] }); setQuestions(qs => qs.map(q => q.id === current.id ? result.question : q)); }
+      setConfirmed(true);
+    } catch (e) { setQuizError(e instanceof Error ? e.message : "Falha de conexão. Tente novamente."); }
+    finally { setQuizBusy(false); }
+  }
+  function nextQuestion() { if (index === questions.length - 1) void finish(); else { setIndex(i => i + 1); setConfirmed(false); setQuizError(""); } }
   function showSource(q: Question) { setSelectedSource(q); setSourceOpen(true); }
   function downloadGuide() {
     const text = `${active.source}\nMaterial autoral de demonstração, dividido em seções de referência.\n\n${active.questions.map(q => `Seção ${q.page} — ${q.topic}\n${q.evidence}`).join("\n\n")}`;
@@ -124,10 +165,10 @@ export function StudyApp() {
         <button className={`nav-item ${view !== "history" ? "active" : ""}`} onClick={() => navigate("library")}><LayoutGrid size={19} />Meus cadernos<span className="nav-count">{all.length}</span></button>
         <button className={`nav-item ${view === "history" ? "active" : ""}`} onClick={() => navigate("history")}><Clock3 size={19} />Histórico de estudo</button>
       </nav>
-      <div className="sidebar-bottom"><div className="small-note"><span className="note-spark"><Sparkles size={18} /></span><strong>Conhecimento que fica.</strong><p>Leia, pratique, descubra.<br />No seu ritmo.</p><div className="note-lines"><span /><span /><span /></div></div><button className="demo-profile" onClick={() => setAboutOpen(true)}><span className="profile-avatar">V</span><span><strong>Visitante</strong><small>Explorando a demonstração</small></span><MoreHorizontal size={19} /></button></div>
+      <div className="sidebar-bottom"><div className="small-note"><span className="note-spark"><Sparkles size={18} /></span><strong>Conhecimento que fica.</strong><p>Leia, pratique, descubra.<br />No seu ritmo.</p><div className="note-lines"><span /><span /><span /></div></div><button className="demo-profile" onClick={() => setAboutOpen(true)}><span className="profile-avatar">V</span><span><strong>Visitante</strong><small>Seu espaço de aprendizado</small></span><MoreHorizontal size={19} /></button></div>
     </aside>
     <div className="main-shell">
-      <header className="topbar"><div className="breadcrumb"><button className="mobile-toggle" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={22} /></button><span>Meu espaço</span><ChevronRight size={14} /><strong>{view === "history" ? "Histórico" : view === "library" ? "Meus cadernos" : active.title}</strong></div><button className="demo-badge" onClick={() => setAboutOpen(true)}><span />Modo demonstração</button></header>
+      <header className="topbar"><div className="breadcrumb"><button className="mobile-toggle" onClick={() => setMobileMenu(true)} aria-label="Abrir menu"><Menu size={22} /></button><span>Meu espaço</span><ChevronRight size={14} /><strong>{view === "history" ? "Histórico" : view === "library" ? "Meus cadernos" : active.title}</strong></div><button className="demo-badge" onClick={() => setAboutOpen(true)}><span />Demonstração + IA</button></header>
       <main id="main" ref={mainRef} tabIndex={-1} className={`main-content ${view === "quiz" ? "quiz-content" : ""}`}>
         {view === "library" && <>
           <div className="page-heading"><div><p className="eyebrow">CURIOSIDADE É UM BOM COMEÇO</p><h1>Seu próximo <em>“entendi!”</em><br />começa aqui.</h1><p className="lead">Reúna seus materiais. Transforme leitura em aprendizado.</p></div><Button onClick={() => setCreateOpen(true)}><Plus size={18} />Novo caderno</Button></div>
@@ -141,37 +182,39 @@ export function StudyApp() {
           <button className="back-link" onClick={() => navigate("library")}><ArrowLeft size={16} />Todos os cadernos</button><div className="detail-heading"><span className={`detail-icon ${active.color}`}><NotebookIcon type={active.icon} size={30} /></span><div><p className="eyebrow">{active.subject}</p><h1>{active.title}</h1><p className="lead">{active.description}</p></div></div>
           <div className="detail-grid"><section className="panel materials"><div className="panel-title"><h2>Seus materiais</h2><span className="count-badge">{files.length + (active.questions.length ? 1 : 0)}</span></div><p className="muted">O ponto de partida para as suas próximas descobertas.</p>
             {active.questions.length > 0 && <div className="source-file"><span className="file-icon"><FileText size={23} /></span><div><strong>{active.source}</strong><span>5 seções · texto autoral de demonstração</span></div><button className="icon-button" onClick={downloadGuide} aria-label="Baixar guia de exemplo"><ArrowDownToLine size={18} /></button></div>}
-            {files.map(f => <div className="source-file" key={f.id}><span className="file-icon neutral"><FileText size={22} /></span><div><strong>{f.name}</strong><span>{Math.max(1, Math.round(f.size / 1024))} KB · apenas selecionado, não processado</span></div><button className="icon-button" aria-label={`Remover ${f.name}`} onClick={() => setStore(s => ({ ...s, files: s.files.filter(item => item.id !== f.id) }))}><Trash2 size={17} /></button></div>)}
+            {files.map(f => <div className="source-file" key={f.id}><span className="file-icon neutral"><FileText size={22} /></span><div><strong>{f.name}</strong><span>{Math.max(1, Math.round(f.size / 1024))} KB · {documents[f.id] ? `${documents[f.id].pages.length} páginas prontas` : "selecione novamente para ler"}</span></div><button className="icon-button" aria-label={`Remover ${f.name}`} disabled={!!reading || generating} onClick={() => { setStore(s => ({ ...s, files: s.files.filter(item => item.id !== f.id) })); setDocuments(d => { const next = { ...d }; delete next[f.id]; return next; }); }}><Trash2 size={17} /></button></div>)}
             <input ref={fileRef} type="file" accept="application/pdf,.pdf" multiple className="sr-only" tabIndex={-1} onChange={e => void addFiles(e.target.files)} aria-label="Selecionar arquivos PDF" />
-            <button className={`dropzone ${dragging ? "dragging" : ""}`} onClick={() => fileRef.current?.click()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); void addFiles(e.dataTransfer.files); }}><span className="upload-icon"><UploadCloud size={26} /></span><strong>Arraste seu PDF até aqui</strong><span>ou clique para selecionar um arquivo</span><small>PDF · até 5 MB · máximo de 5 arquivos</small></button>
+            <button disabled={!!reading || generating} className={`dropzone ${dragging ? "dragging" : ""}`} onClick={() => fileRef.current?.click()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); void addFiles(e.dataTransfer.files); }}><span className="upload-icon"><UploadCloud size={26} /></span><strong>Arraste seu PDF até aqui</strong><span>ou clique para selecionar um arquivo</span><small>PDF textual · até 5 MB e 20 páginas · 5 arquivos</small></button>
+            {reading && <p className="microcopy" role="status">{reading}</p>}
             {fileError && <p className="error-message" role="alert">{fileError}</p>}
-            <div className="info-note"><Lightbulb size={18} /><p><strong>Uma prévia do que vem por aí.</strong> Nesta versão, salvamos só o nome e o tamanho do PDF neste navegador. O arquivo não é enviado, lido ou usado nas questões.</p></div>
-          </section><section className="panel practice-panel"><span className="eyebrow"><Sparkles size={14} />HORA DE PRATICAR</span><h2>Transforme curiosidade<br />em conhecimento.</h2><p className="muted">{active.questions.length ? "Experimente as questões prontas do guia demonstrativo deste caderno." : "Seu caderno está pronto para receber materiais. A geração por IA será conectada na próxima etapa."}</p>
-            {active.questions.length > 0 ? <><fieldset className="form-group"><legend>Quantidade de questões</legend><div className="segmented">{[3, 5].map(value => <button key={value} aria-pressed={count === value} className={count === value ? "selected" : ""} onClick={() => setCount(value)}>{value} questões</button>)}</div></fieldset><fieldset className="form-group"><legend>Como você quer estudar?</legend><button className={`mode-option ${mode === "study" ? "selected" : ""}`} aria-pressed={mode === "study"} onClick={() => setMode("study")}><Lightbulb size={19} /><span><strong>Aprender no caminho</strong><small>Correção depois de cada resposta</small></span><span className="radio-dot" /></button><button className={`mode-option ${mode === "exam" ? "selected" : ""}`} aria-pressed={mode === "exam"} onClick={() => setMode("exam")}><Target size={19} /><span><strong>Testar meu conhecimento</strong><small>Resultado e explicações ao final</small></span><span className="radio-dot" /></button></fieldset><Button className="full-width" onClick={startQuiz}>Começar demonstração<ArrowRight size={17} /></Button><p className="microcopy">Questões prontas · sem uso de IA ou consumo de API</p></> : <Button className="full-width" variant="outline" onClick={() => openNotebook(notebooks[0])}>Experimentar um caderno de exemplo<ArrowRight size={16} /></Button>}
+            <div className="info-note"><Lightbulb size={18} /><p><strong>Seu PDF começa aqui.</strong> O texto é extraído no navegador, sem enviar o arquivo original. Ao gerar, o texto vai ao servidor e ao Gemini. Recarregar a página exige selecionar o PDF novamente.</p></div>
+          </section><section className="panel practice-panel"><span className="eyebrow"><Sparkles size={14} />HORA DE PRATICAR</span><h2>Transforme curiosidade<br />em conhecimento.</h2><p className="muted">{active.questions.length ? "Experimente as questões prontas do guia demonstrativo deste caderno." : "Adicione seu PDF e transforme o conteúdo em questões com referências às páginas."}</p>
+            <AiPanel documents={Object.fromEntries(files.filter(f => documents[f.id]).map(f => [f.id, documents[f.id]]))} reading={!!reading} onBusy={setGenerating} onStart={beginQuiz} />
+            {active.questions.length > 0 ? <><h3 className="demo-section-title">Ou pratique com o guia de exemplo</h3><fieldset className="form-group"><legend>Quantidade de questões</legend><div className="segmented">{[3, 5].map(value => <button key={value} aria-pressed={count === value} className={count === value ? "selected" : ""} onClick={() => setCount(value)}>{value} questões</button>)}</div></fieldset><fieldset className="form-group"><legend>Como você quer estudar?</legend><button className={`mode-option ${mode === "study" ? "selected" : ""}`} aria-pressed={mode === "study"} onClick={() => setMode("study")}><Lightbulb size={19} /><span><strong>Aprender no caminho</strong><small>Correção depois de cada resposta</small></span><span className="radio-dot" /></button><button className={`mode-option ${mode === "exam" ? "selected" : ""}`} aria-pressed={mode === "exam"} onClick={() => setMode("exam")}><Target size={19} /><span><strong>Testar meu conhecimento</strong><small>Resultado e explicações ao final</small></span><span className="radio-dot" /></button></fieldset><Button className="full-width" disabled={generating || !!reading} onClick={startQuiz}>Começar demonstração<ArrowRight size={17} /></Button><p className="microcopy">Questões prontas · sem uso de IA ou consumo de API</p></> : <Button className="full-width" variant="outline" onClick={() => openNotebook(notebooks[0])}>Experimentar um caderno de exemplo<ArrowRight size={16} /></Button>}
           </section></div>
         </>}
 
         {view === "quiz" && current && <>
-          <div className="quiz-top"><button className="back-link" onClick={() => navigate("notebook")}><ArrowLeft size={16} />Sair da prática</button><span className="tiny-badge">{mode === "study" ? "MODO ESTUDO" : "MODO SIMULADO"} · EXEMPLO</span></div><div className="quiz-progress-label"><span>Questão <strong>{index + 1}</strong> de {questions.length}</span><span>{Math.round(index / questions.length * 100)}% concluído</span></div><div className="progress-track"><span style={{ width: `${index / questions.length * 100}%` }} /></div>
+          <div className="quiz-top"><button className="back-link" onClick={() => navigate("notebook")}><ArrowLeft size={16} />Sair da prática</button><span className="tiny-badge">{mode === "study" ? "MODO ESTUDO" : "MODO SIMULADO"} · {quizToken ? "GERADO POR IA" : "EXEMPLO"}</span></div><div className="quiz-progress-label"><span>Questão <strong>{index + 1}</strong> de {questions.length}</span><span>{Math.round(index / questions.length * 100)}% concluído</span></div><div className="progress-track"><span style={{ width: `${index / questions.length * 100}%` }} /></div>
           <section className="question-panel" aria-labelledby="question-title"><div className="question-meta"><span>{current.topic}</span><span><BookOpen size={14} />{active.title}</span></div><h1 id="question-title">{current.prompt}</h1><p className="question-hint">Selecione uma alternativa.</p><fieldset className="answers"><legend className="sr-only">Alternativas</legend>{current.options.map((option, i) => {
             const reveal = confirmed && mode === "study"; const isSelected = answers[current.id] === i;
             return <label key={option} className={`answer ${isSelected ? "is-selected" : ""} ${reveal && i === current.correct ? "is-correct" : ""} ${reveal && isSelected && i !== current.correct ? "is-wrong" : ""} ${confirmed ? "is-locked" : ""}`}><input type="radio" name={current.id} value={i} checked={isSelected} disabled={confirmed} onChange={() => setAnswers(a => ({ ...a, [current.id]: i }))} /><span className="answer-letter">{"ABCD"[i]}</span><span>{option}</span>{reveal && i === current.correct ? <CheckCircle2 size={20} /> : reveal && isSelected ? <XCircle size={20} /> : <span className="answer-circle" />}</label>;
           })}</fieldset>
           {confirmed && mode === "study" && <div className={`answer-feedback ${answers[current.id] === current.correct ? "positive" : "negative"}`} role="status"><strong>{answers[current.id] === current.correct ? "Isso mesmo. Mais uma conexão feita!" : "Faz parte do caminho. Vamos entender?"}</strong><p>{current.explanation}</p><button className="text-link" onClick={() => showSource(current)}><BookOpen size={15} />Ver trecho da fonte<ArrowRight size={14} /></button></div>}
-          <div className="question-bottom"><span><Lightbulb size={16} />{confirmed ? "Cada resposta é uma oportunidade de aprender." : "Não é uma corrida. Pense com calma."}</span>{!confirmed ? <Button disabled={answers[current.id] === undefined} onClick={() => { if (mode === "exam") nextQuestion(); else setConfirmed(true); }}>{mode === "exam" ? index === questions.length - 1 ? "Concluir simulado" : "Próxima questão" : "Confirmar resposta"}<ArrowRight size={16} /></Button> : <Button onClick={nextQuestion}>{index === questions.length - 1 ? "Ver meu resultado" : "Próxima questão"}<ArrowRight size={16} /></Button>}</div></section><p className="quiz-footnote">Questões demonstrativas baseadas no guia de exemplo. Seus PDFs não são utilizados.</p>
+          <div className="question-bottom"><span><Lightbulb size={16} />{confirmed ? "Cada resposta é uma oportunidade de aprender." : "Não é uma corrida. Pense com calma."}</span>{!confirmed ? <Button disabled={answers[current.id] === undefined || quizBusy} onClick={() => void confirmAnswer()}>{mode === "exam" ? index === questions.length - 1 ? "Concluir simulado" : "Próxima questão" : "Confirmar resposta"}<ArrowRight size={16} /></Button> : <Button disabled={quizBusy} onClick={nextQuestion}>{index === questions.length - 1 ? "Ver meu resultado" : "Próxima questão"}<ArrowRight size={16} /></Button>}</div>{quizBusy && <p role="status" className="microcopy">Conferindo resposta…</p>}{quizError && <p role="alert" className="error-message">{quizError}</p>}</section><p className="quiz-footnote">{quizToken ? "Gerado por IA a partir do seu PDF. Referências conferidas no texto; revise possíveis erros de interpretação." : "Questões demonstrativas baseadas no guia de exemplo. Seus PDFs não são utilizados."}</p>
         </>}
 
         {view === "result" && <>
-          <button className="back-link" onClick={() => navigate("notebook")}><ArrowLeft size={16} />Voltar ao caderno</button><section className="result-hero"><span className="result-spark"><Sparkles size={25} /></span><p className="eyebrow">UM PASSO A MAIS NO SEU APRENDIZADO</p><h1>Você fez novas <em>conexões.</em></h1><p className="lead">{active.title} · prática demonstrativa concluída</p><div className="result-stats"><div><strong>{grade(questions, answers)}<small>/{questions.length}</small></strong><span>respostas corretas</span></div><div><strong>{Math.round(grade(questions, answers) / questions.length * 100)}<small>%</small></strong><span>de aproveitamento</span></div><div><strong>{questions.length}</strong><span>ideias revisitadas</span></div></div><div className="result-actions"><Button onClick={startQuiz}>Praticar novamente<ArrowRight size={16} /></Button><Button variant="outline" onClick={() => navigate("library")}>Explorar cadernos</Button></div></section>
-          <div className="section-toolbar review-toolbar"><div><h2>Aprenda com cada resposta</h2><p>Revisite as explicações e conecte os pontos.</p></div><label className="check-filter"><input type="checkbox" checked={onlyWrong} onChange={e => setOnlyWrong(e.target.checked)} />Só as que errei</label></div><div className="review-list">{questions.filter(q => !onlyWrong || answers[q.id] !== q.correct).map(q => <article className="review-card" key={q.id}><div className={`review-status ${answers[q.id] === q.correct ? "correct" : "wrong"}`}>{answers[q.id] === q.correct ? <Check size={19} /> : <X size={19} />}</div><div><span className="eyebrow">{q.topic}</span><h3>{q.prompt}</h3><p className={answers[q.id] === q.correct ? "correct-text" : "wrong-text"}>Sua resposta: {q.options[answers[q.id]]}</p>{answers[q.id] !== q.correct && <p className="correct-text">Resposta correta: {q.options[q.correct]}</p>}<p>{q.explanation}</p><button className="text-link" onClick={() => showSource(q)}><BookOpen size={15} />Consultar fonte · seção {q.page}<ArrowRight size={14} /></button></div></article>)}</div>{onlyWrong && grade(questions, answers) === questions.length && <div className="empty-state"><CheckCircle2 size={32} /><h3>Todas as conexões feitas!</h3><p>Você acertou todas as questões desta prática.</p></div>}
+          <button className="back-link" onClick={() => navigate("notebook")}><ArrowLeft size={16} />Voltar ao caderno</button><section className="result-hero"><span className="result-spark"><Sparkles size={25} /></span><p className="eyebrow">UM PASSO A MAIS NO SEU APRENDIZADO</p><h1>Você fez novas <em>conexões.</em></h1><p className="lead">{active.title} · {quizToken ? "prática com IA" : "prática demonstrativa"} concluída</p><div className="result-stats"><div><strong>{grade(questions, answers)}<small>/{questions.length}</small></strong><span>respostas corretas</span></div><div><strong>{Math.round(grade(questions, answers) / questions.length * 100)}<small>%</small></strong><span>de aproveitamento</span></div><div><strong>{questions.length}</strong><span>ideias revisitadas</span></div></div><div className="result-actions"><Button onClick={() => beginQuiz(questions, quizToken)}>Praticar novamente<ArrowRight size={16} /></Button><Button variant="outline" onClick={() => navigate("library")}>Explorar cadernos</Button></div></section>
+          <div className="section-toolbar review-toolbar"><div><h2>Aprenda com cada resposta</h2><p>Revisite as explicações e conecte os pontos.</p></div><label className="check-filter"><input type="checkbox" checked={onlyWrong} onChange={e => setOnlyWrong(e.target.checked)} />Só as que errei</label></div><div className="review-list">{questions.filter(q => !onlyWrong || answers[q.id] !== q.correct).map(q => <article className="review-card" key={q.id}><div className={`review-status ${answers[q.id] === q.correct ? "correct" : "wrong"}`}>{answers[q.id] === q.correct ? <Check size={19} /> : <X size={19} />}</div><div><span className="eyebrow">{q.topic}</span><h3>{q.prompt}</h3><p className={answers[q.id] === q.correct ? "correct-text" : "wrong-text"}>Sua resposta: {q.options[answers[q.id]]}</p>{answers[q.id] !== q.correct && <p className="correct-text">Resposta correta: {q.options[q.correct]}</p>}<p>{q.explanation}</p><button className="text-link" onClick={() => showSource(q)}><BookOpen size={15} />Consultar fonte · {q.source ? "página" : "seção"} {q.page}<ArrowRight size={14} /></button></div></article>)}</div>{onlyWrong && grade(questions, answers) === questions.length && <div className="empty-state"><CheckCircle2 size={32} /><h3>Todas as conexões feitas!</h3><p>Você acertou todas as questões desta prática.</p></div>}
         </>}
 
-        {view === "history" && <><div className="page-heading"><div><p className="eyebrow">CADA PASSO CONTA</p><h1>Seu caminho <em>até aqui.</em></h1><p className="lead">Práticas concluídas e pequenas conquistas.</p></div></div>{store.attempts.length ? <div className="history-list">{store.attempts.map(a => <article className="history-card" key={a.id}><span className="history-icon"><CheckCircle2 size={22} /></span><div><h3>{a.title}</h3><p>{new Date(a.date).toLocaleString("pt-BR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })} · demonstração</p></div><div className="history-score"><strong>{a.score}/{a.total}</strong><span>acertos</span></div><Button variant="ghost" size="sm" onClick={() => openNotebook(all.find(n => n.id === a.notebookId) || notebooks[0])}>Praticar<ArrowRight size={15} /></Button></article>)}</div> : <div className="empty-state history-empty"><Clock3 size={38} /><h2>Todo caminho tem um começo.</h2><p>Conclua sua primeira prática para acompanhar seu aprendizado aqui.</p><Button onClick={() => openNotebook(notebooks[0])}>Começar minha primeira prática<ArrowRight size={16} /></Button></div>}<p className="microcopy">Histórico salvo apenas neste navegador. Não há conta ou sincronização nesta versão.</p></>}
+        {view === "history" && <><div className="page-heading"><div><p className="eyebrow">CADA PASSO CONTA</p><h1>Seu caminho <em>até aqui.</em></h1><p className="lead">Práticas concluídas e pequenas conquistas.</p></div></div>{store.attempts.length ? <div className="history-list">{store.attempts.map(a => <article className="history-card" key={a.id}><span className="history-icon"><CheckCircle2 size={22} /></span><div><h3>{a.title}</h3><p>{new Date(a.date).toLocaleString("pt-BR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })} · {a.kind === "ai" ? "gerado por IA" : "demonstração"}</p></div><div className="history-score"><strong>{a.score}/{a.total}</strong><span>acertos</span></div><Button variant="ghost" size="sm" onClick={() => openNotebook(all.find(n => n.id === a.notebookId) || notebooks[0])}>Praticar<ArrowRight size={15} /></Button></article>)}</div> : <div className="empty-state history-empty"><Clock3 size={38} /><h2>Todo caminho tem um começo.</h2><p>Conclua sua primeira prática para acompanhar seu aprendizado aqui.</p><Button onClick={() => openNotebook(notebooks[0])}>Começar minha primeira prática<ArrowRight size={16} /></Button></div>}<p className="microcopy">Histórico salvo apenas neste navegador. Não há conta ou sincronização nesta versão.</p></>}
       </main>
     </div>
-    <Dialog open={createOpen} onOpenChange={setCreateOpen} title="Uma nova descoberta começa aqui." description="Dê um nome ao seu caderno e organize seu próximo assunto."><form onSubmit={createNotebook} className="create-form"><label>Nome do caderno<input autoFocus required maxLength={60} placeholder="Ex.: Fundamentos de programação" value={title} onChange={e => setTitle(e.target.value)} /></label><label>Área de estudo <span>(opcional)</span><input maxLength={35} placeholder="Ex.: Tecnologia" value={subject} onChange={e => setSubject(e.target.value)} /></label><p className="microcopy">Salvo neste navegador. A geração de questões por IA ainda não está conectada.</p><Button type="submit" disabled={!title.trim()} className="full-width"><Plus size={16} />Criar caderno</Button></form></Dialog>
-    <Dialog open={aboutOpen} onOpenChange={setAboutOpen} title="Aprender entre as linhas." description="Entrelinhas é um projeto de portfólio em construção."><div className="about-content"><p>Esta é uma demonstração interativa: você pode explorar três guias autorais, responder questões prontas, consultar os trechos de referência e acompanhar seu histórico.</p><div className="info-note"><Lightbulb size={20} /><p>Não há IA, login ou envio de arquivos nesta etapa. Cadernos, nomes de arquivos e resultados ficam apenas no armazenamento local do seu navegador.</p></div><p>Próximos passos: leitura de PDFs, geração fundamentada por IA e conta com materiais privados.</p><Button className="full-width" onClick={() => setAboutOpen(false)}>Vamos explorar<ArrowRight size={16} /></Button></div></Dialog>
-    <Dialog open={sourceOpen} onOpenChange={setSourceOpen} title="Volte à fonte." description={`${active.source} · seção ${selectedSource?.page ?? ""}`}><div className="source-content"><span className="eyebrow">{selectedSource?.topic}</span><blockquote>{selectedSource?.evidence}</blockquote><p className="microcopy">Trecho do guia autoral de exemplo. Esta referência não pertence a um PDF enviado.</p><Button variant="outline" onClick={() => setSourceOpen(false)}>Voltar à questão</Button></div></Dialog>
+    <Dialog open={createOpen} onOpenChange={setCreateOpen} title="Uma nova descoberta começa aqui." description="Dê um nome ao seu caderno e organize seu próximo assunto."><form onSubmit={createNotebook} className="create-form"><label>Nome do caderno<input autoFocus required maxLength={60} placeholder="Ex.: Fundamentos de programação" value={title} onChange={e => setTitle(e.target.value)} /></label><label>Área de estudo <span>(opcional)</span><input maxLength={35} placeholder="Ex.: Tecnologia" value={subject} onChange={e => setSubject(e.target.value)} /></label><p className="microcopy">Salvo neste navegador. Adicione um PDF para gerar questões com IA.</p><Button type="submit" disabled={!title.trim()} className="full-width"><Plus size={16} />Criar caderno</Button></form></Dialog>
+    <Dialog open={aboutOpen} onOpenChange={setAboutOpen} title="Aprender entre as linhas." description="Entrelinhas é um projeto de portfólio em construção."><div className="about-content"><p>Explore os guias de exemplo ou crie questões a partir de um PDF textual. As respostas geradas por IA incluem trechos conferidos no texto extraído. Essa verificação não garante a correção da interpretação.</p><div className="info-note"><Lightbulb size={20} /><p>Não há login ou sincronização. Cadernos e histórico ficam neste navegador. PDFs e texto extraído ficam apenas na sessão. Ao gerar, o texto é enviado ao servidor e ao Gemini; não é salvo no banco da aplicação.</p></div><p>A geração está sujeita a cotas. PDFs escaneados, imagens e fórmulas complexas não são interpretados nesta versão.</p><Button className="full-width" onClick={() => setAboutOpen(false)}>Vamos explorar<ArrowRight size={16} /></Button></div></Dialog>
+    <Dialog open={sourceOpen} onOpenChange={setSourceOpen} title="Volte à fonte." description={`${selectedSource?.source || active.source} · ${selectedSource?.source ? "página" : "seção"} ${selectedSource?.page ?? ""}`}><div className="source-content"><span className="eyebrow">{selectedSource?.topic}</span><blockquote>{selectedSource?.evidence}</blockquote><p className="microcopy">{selectedSource?.source ? "Trecho conferido no texto extraído. A página é a posição física no PDF, que pode diferir da numeração impressa." : "Trecho do guia autoral de exemplo. Esta referência não pertence a um PDF enviado."}</p><Button variant="outline" onClick={() => setSourceOpen(false)}>Voltar à questão</Button></div></Dialog>
     <Dialog open={exitOpen} onOpenChange={setExitOpen} title="Sair desta prática?" description="As respostas desta sessão não serão salvas no histórico até você concluir."><div className="dialog-actions"><Button variant="outline" onClick={() => setExitOpen(false)}>Continuar estudando</Button><Button onClick={() => { setExitOpen(false); setView(pendingView); }}>Sair da prática</Button></div></Dialog>
     {notice && <div className="toast" role="status"><CheckCircle2 size={19} /><span>{notice}</span><button onClick={() => setNotice("")} aria-label="Fechar aviso"><X size={17} /></button></div>}
   </div>;
