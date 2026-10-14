@@ -22,9 +22,10 @@ test("validação exige evidência literal na página certa e opções únicas",
   }
 });
 test("Gemini retorna perguntas validadas e traduz erros sem revelar chave", async () => {
-  const result = await generateQuestions(document, 3, "test-secret", "gemini-2.5-flash", mockFetch({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(generated) }] } }] }));
+  const result = await generateQuestions(document, 3, "test-secret", "gemini-3.5-flash-lite", mockFetch({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(generated) }] } }] }));
   assert.equal(result.length, 3);
-  for (const status of [400, 403, 404, 429, 500]) await assert.rejects(generateQuestions(document, 3, "test-secret", "gemini-2.5-flash", mockFetch({ error: "test-secret" }, status)), (e: unknown) => e instanceof AppError && !e.message.includes("test-secret"));
+  await assert.rejects(generateQuestions(document, 3, "test-secret", "gemini-3.5-flash-lite", mockFetch({}, 404)), (e: unknown) => e instanceof AppError && e.code === "MODEL_UNAVAILABLE");
+  for (const status of [400, 403, 404, 429, 500]) await assert.rejects(generateQuestions(document, 3, "test-secret", "gemini-3.5-flash-lite", mockFetch({ error: "test-secret" }, status)), (e: unknown) => e instanceof AppError && !e.message.includes("test-secret"));
 });
 test("gabarito é cifrado; sessão alterada, expirada ou com chave errada falha", () => {
   const qs = validateQuestions(generated, document, 3);

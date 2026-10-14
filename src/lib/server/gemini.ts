@@ -36,7 +36,8 @@ export async function generateQuestions(document: SourceDocument, count: number,
     });
   } catch { throw new AppError(504, "PROVIDER_TIMEOUT", "O Gemini demorou para responder. Tente novamente em alguns instantes."); }
   if (response.status === 429) throw new AppError(429, "PROVIDER_QUOTA", "A cota do Gemini foi atingida. Tente mais tarde ou explore um caderno de exemplo.");
-  if ([400, 401, 403, 404].includes(response.status)) throw new AppError(503, "PROVIDER_CONFIG", "O Gemini não aceitou a configuração do servidor. O responsável precisa verificar a chave, o modelo e a disponibilidade na conta.");
+  if (response.status === 404) throw new AppError(503, "MODEL_UNAVAILABLE", "O modelo Gemini configurado não está disponível para este projeto. O responsável precisa atualizar GEMINI_MODEL na Vercel e publicar novamente.");
+  if ([400, 401, 403].includes(response.status)) throw new AppError(503, "PROVIDER_CONFIG", "O Gemini não aceitou a configuração do servidor. O responsável precisa verificar a chave, o modelo e a disponibilidade na conta.");
   if (!response.ok) throw new AppError(502, "PROVIDER_UNAVAILABLE", "O Gemini está indisponível. Seus materiais continuam nesta sessão.");
   try {
     const result = await response.json();

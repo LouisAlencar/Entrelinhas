@@ -11,7 +11,7 @@ export async function POST(request: Request) {
     const key = process.env.GEMINI_API_KEY;
     if (!key) throw new AppError(503, "AI_NOT_CONFIGURED", "A IA ainda não está configurada neste ambiente. Experimente os cadernos de exemplo.");
     await reserveGeneration(request.headers);
-    const questions = await generateQuestions(document, count, key, process.env.GEMINI_MODEL || "gemini-2.5-flash");
+    const questions = await generateQuestions(document, count, key, process.env.GEMINI_MODEL || "gemini-3.5-flash-lite");
     return json({ questions: publicQuestions(questions), token: sealQuiz(questions, key), source: document.name });
   } catch (error) { return failure(error); }
 }

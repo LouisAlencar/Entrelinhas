@@ -23,7 +23,7 @@ Neste computador, `Start-Entrelinhas.ps1` também encontra o runtime do Codex. M
 | Variável | Valor |
 |---|---|
 | `GEMINI_API_KEY` | Chave da Gemini Developer API |
-| `GEMINI_MODEL` | Opcional; padrão `gemini-2.5-flash` |
+| `GEMINI_MODEL` | Opcional; padrão `gemini-3.5-flash-lite` |
 | `SUPABASE_URL` | URL HTTPS do projeto Supabase |
 | `SUPABASE_SERVICE_ROLE_KEY` | Chave secreta `service_role` do Supabase |
 
